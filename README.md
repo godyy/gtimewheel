@@ -43,7 +43,10 @@ func main() {
         for {
             select {
             case <-ticker.C:
-                timewheel.Tick(1)
+                // 开始tick.
+                timewheel.Tick()
+                // 等待tick结束.
+                timewheel.TickEnd()
             }
         }
     }
