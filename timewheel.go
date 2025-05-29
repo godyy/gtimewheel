@@ -176,6 +176,9 @@ type TimeWheel struct {
 	ticks               int64          // 当前tick数，用于追踪绝对时间.
 	totalTickTime       time.Duration  // 时间轮总运行时长.
 
+	addAmount     int64 // 总添加数量.
+	removeAmount  int64 // 总移除数量.
+	triggerAmount int64 // 总触发数量. 定时器到期并成功执行回调函数.
 }
 
 // NewTimeWheel 创建时间轮
@@ -401,6 +404,8 @@ func (tw *TimeWheel) AddTimer(opts TimerOptions) (uint64, error) {
 		timerPool.add(timer)
 		// 固定定时器到时间轮
 		tw.pinTimer(timer, true)
+		// 更新统计数据.
+		atomic.AddInt64(&tw.addAmount, 1)
 	}
 	timerPool.mtx.Unlock()
 
@@ -496,6 +501,9 @@ func (tw *TimeWheel) RemoveTimer(tid uint64) bool {
 		}
 		level.mtx.Unlock()
 	}
+
+	// 更新统计数据.
+	atomic.AddInt64(&tw.removeAmount, 1)
 
 	return true
 }
@@ -635,6 +643,8 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 					timerPool.mtx.Unlock()
 					continue
 				}
+				// 更新统计数据.
+				atomic.AddInt64(&tw.removeAmount, 1)
 			}
 
 			timerPool.mtx.Unlock()
@@ -644,6 +654,9 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 				TID:  timer.id,
 				Args: timer.args,
 			})
+
+			// 更新统计数据.
+			atomic.AddInt64(&tw.triggerAmount, 1)
 
 		} else {
 			// 定时器未到期, 降层调度.
@@ -734,4 +747,22 @@ func (tw *TimeWheel) reset() {
 	tw.ticks = 0
 	tw.totalTickTime = 0
 	tw.triggerLevelAmount = 0
+	atomic.StoreInt64(&tw.addAmount, 0)
+	atomic.StoreInt64(&tw.removeAmount, 0)
+	atomic.StoreInt64(&tw.triggerAmount, 0)
+}
+
+// AddAmount 获取总添加数量.
+func (tw *TimeWheel) AddAmount() int64 {
+	return atomic.LoadInt64(&tw.addAmount)
+}
+
+// RemoveAmount 获取总移除数量.
+func (tw *TimeWheel) RemoveAmount() int64 {
+	return atomic.LoadInt64(&tw.removeAmount)
+}
+
+// TriggerAmount 获取总触发数量.
+func (tw *TimeWheel) TriggerAmount() int64 {
+	return atomic.LoadInt64(&tw.triggerAmount)
 }
