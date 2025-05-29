@@ -60,17 +60,33 @@ func newTimer(id uint64, delay int64, periodic bool, f TimerFunc, args any) *tim
 
 // timerPool 定时器池.
 type timerPool struct {
-	mtx sync.RWMutex      // 互斥锁.
-	m   map[uint64]*timer // 映射.
+	mtx    sync.RWMutex      // 互斥锁.
+	timers map[uint64]*timer // 映射.
 }
 
-func (p *timerPool) exists(timerId uint64) bool {
-	_, exists := p.m[timerId]
+func (p *timerPool) add(timer *timer) {
+	p.timers[timer.id] = timer
+}
+
+func (p *timerPool) get(tid uint64) *timer {
+	return p.timers[tid]
+}
+
+func (p *timerPool) remove(tid uint64) *timer {
+	timer := p.timers[tid]
+	if timer != nil {
+		delete(p.timers, tid)
+	}
+	return timer
+}
+
+func (p *timerPool) exists(tid uint64) bool {
+	_, exists := p.timers[tid]
 	return exists
 }
 
 func (p *timerPool) reset() {
-	p.m = make(map[uint64]*timer)
+	p.timers = make(map[uint64]*timer)
 }
 
 // slot 槽位.
@@ -83,8 +99,8 @@ func (s *slot) add(t *timer) {
 	s.timers[t.id] = t
 }
 
-func (s *slot) remove(timerId uint64) {
-	delete(s.timers, timerId)
+func (s *slot) remove(tid uint64) {
+	delete(s.timers, tid)
 }
 
 func (s *slot) empty() bool {
@@ -113,8 +129,8 @@ func (l *level) addDelayTimer(timer *timer) {
 	l.delayTimers[timer.id] = timer
 }
 
-func (l *level) removeDelayTimer(timerId uint64) {
-	delete(l.delayTimers, timerId)
+func (l *level) removeDelayTimer(tid uint64) {
+	delete(l.delayTimers, tid)
 }
 
 func (l *level) popDelayTimers() map[uint64]*timer {
@@ -212,7 +228,7 @@ func NewTimeWheel(configs []LevelConfig, executor TimerExecutor) (*TimeWheel, er
 	// 初始化定时器池.
 	for i := 0; i < runtime.NumCPU(); i++ {
 		tw.timerPools[i] = &timerPool{
-			m: make(map[uint64]*timer),
+			timers: make(map[uint64]*timer),
 		}
 	}
 
@@ -269,16 +285,16 @@ func (tw *TimeWheel) isStopped() bool {
 
 // genTimerId 生成定时器ID.
 func (tw *TimeWheel) genTimerId() uint64 {
-	timerId := atomic.AddUint64(&tw.timerIdGen, 1)
-	if timerId == 0 {
-		timerId = atomic.AddUint64(&tw.timerIdGen, 1)
+	tid := atomic.AddUint64(&tw.timerIdGen, 1)
+	if tid == 0 {
+		tid = atomic.AddUint64(&tw.timerIdGen, 1)
 	}
-	return timerId
+	return tid
 }
 
 // getTimerPool 获取定时器池.
-func (tw *TimeWheel) getTimerPool(timerId uint64) *timerPool {
-	return tw.timerPools[timerId%uint64(len(tw.timerPools))]
+func (tw *TimeWheel) getTimerPool(tid uint64) *timerPool {
+	return tw.timerPools[tid%uint64(len(tw.timerPools))]
 }
 
 // tickSpan 获取时间轮的tick跨度.
@@ -357,13 +373,13 @@ func (tw *TimeWheel) AddTimer(opts TimerOptions) (uint64, error) {
 	}
 
 	// 生成定时器定时器ID
-	timerId := tw.genTimerId()
+	tid := tw.genTimerId()
 
 	// 将延时转换为tick数.
 	delay := convertDelayToTicks(opts.Delay, tw.tickSpan())
 
 	// 创建定时器.
-	timer := newTimer(timerId, delay, opts.Periodic, opts.Func, opts.Args)
+	timer := newTimer(tid, delay, opts.Periodic, opts.Func, opts.Args)
 
 	// 锁定时间轮.
 	// 保证在添加定时器期间, 时间轮不会tick.
@@ -378,17 +394,17 @@ func (tw *TimeWheel) AddTimer(opts TimerOptions) (uint64, error) {
 	timer.scheduleTicks = tw.calcScheduleTicks(opts.Delay + opts.Offset)
 
 	// 添加定时器.
-	timerPool := tw.getTimerPool(timerId)
+	timerPool := tw.getTimerPool(tid)
 	timerPool.mtx.Lock()
 	{
 		// 添加到定时器池.
-		timerPool.m[timerId] = timer
+		timerPool.add(timer)
 		// 固定定时器到时间轮
 		tw.pinTimer(timer, true)
 	}
 	timerPool.mtx.Unlock()
 
-	return timerId, nil
+	return tid, nil
 }
 
 // pinTimer 将定时器固定到时间轮的层级结构中
@@ -449,23 +465,20 @@ func (tw *TimeWheel) pinTimer(timer *timer, insideAddTimer bool) {
 }
 
 // RemoveTimer 从时间轮中删除指定定时器
-func (tw *TimeWheel) RemoveTimer(timerId uint64) bool {
+func (tw *TimeWheel) RemoveTimer(tid uint64) bool {
 	if tw.isStopped() {
 		return false
 	}
 
-	timerPool := tw.getTimerPool(timerId)
+	timerPool := tw.getTimerPool(tid)
 	timerPool.mtx.Lock()
 
-	// 查找定时器.
-	timer, exists := timerPool.m[timerId]
-	if !exists {
+	// 删除定时器.
+	timer := timerPool.remove(tid)
+	if timer == nil {
 		timerPool.mtx.Unlock()
 		return false
 	}
-
-	// 删除定时器.
-	delete(timerPool.m, timerId)
 
 	timerPool.mtx.Unlock()
 
@@ -474,11 +487,11 @@ func (tw *TimeWheel) RemoveTimer(timerId uint64) bool {
 		level := tw.levels[timer.level]
 		level.mtx.Lock()
 		if timer.slot == level.triggerSlot {
-			level.removeDelayTimer(timerId)
+			level.removeDelayTimer(tid)
 		} else {
 			slot := level.slots[timer.slot]
 			slot.mtx.Lock()
-			slot.remove(timerId)
+			slot.remove(tid)
 			slot.mtx.Unlock()
 		}
 		level.mtx.Unlock()
@@ -594,7 +607,7 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 	// 触发槽位中的定时器.
 	for tid, timer := range slot.timers {
 		// 删除定时器.
-		delete(slot.timers, tid)
+		slot.remove(tid)
 
 		// 获取定时器池.
 		timerPool := tw.getTimerPool(timer.id)
@@ -603,16 +616,11 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 		if tw.ticks >= timer.scheduleTicks {
 			// 定时器已到期.
 
-			// 执行定时器
-			tw.executor(timer.f, TimerArgs{
-				TID:  timer.id,
-				Args: timer.args,
-			})
+			timerPool.mtx.Lock()
 
 			// 根据定时器是否周期性做相应处理.
 			if timer.periodic {
 				// 周期性定时器, 重置状态.
-				timerPool.mtx.Lock()
 				if !timerPool.exists(timer.id) {
 					timerPool.mtx.Unlock()
 					continue
@@ -621,13 +629,21 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 				timer.slot = -1
 				timer.scheduleTicks = tw.ticks + timer.delay
 				tw.pinTimer(timer, false)
-				timerPool.mtx.Unlock()
 			} else {
 				// 非周期性定时器直接删除.
-				timerPool.mtx.Lock()
-				delete(timerPool.m, timer.id)
-				timerPool.mtx.Unlock()
+				if timerPool.remove(timer.id) == nil {
+					timerPool.mtx.Unlock()
+					continue
+				}
 			}
+
+			timerPool.mtx.Unlock()
+
+			// 执行定时器
+			tw.executor(timer.f, TimerArgs{
+				TID:  timer.id,
+				Args: timer.args,
+			})
 
 		} else {
 			// 定时器未到期, 降层调度.

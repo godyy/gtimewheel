@@ -375,8 +375,8 @@ func TestTimeWheelReset(t *testing.T) {
 	// 验证定时器池是否被清空
 	for _, pool := range tw.timerPools {
 		pool.mtx.Lock()
-		if len(pool.m) != 0 {
-			t.Errorf("Expected timer pool to be empty after reset, got %d timers", len(pool.m))
+		if len(pool.timers) != 0 {
+			t.Errorf("Expected timer pool to be empty after reset, got %d timers", len(pool.timers))
 		}
 		pool.mtx.Unlock()
 	}
@@ -527,8 +527,8 @@ func TestTimeWheelConcurrent(t *testing.T) {
 	// 验证所有定时器池是否为空
 	for _, pool := range tw.timerPools {
 		pool.mtx.Lock()
-		if len(pool.m) != 0 {
-			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.m))
+		if len(pool.timers) != 0 {
+			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.timers))
 		}
 		pool.mtx.Unlock()
 	}
@@ -641,8 +641,8 @@ func TestTimeWheelExtremeConcurrent(t *testing.T) {
 	// 验证所有定时器池是否为空
 	for _, pool := range tw.timerPools {
 		pool.mtx.Lock()
-		if len(pool.m) != 0 {
-			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.m))
+		if len(pool.timers) != 0 {
+			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.timers))
 		}
 		pool.mtx.Unlock()
 	}
