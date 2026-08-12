@@ -1,6 +1,7 @@
 package gtimewheel
 
 import (
+	"errors"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -8,9 +9,15 @@ import (
 	"time"
 )
 
+var testTimerId uint64
+
+func genTestTimerId() TimerID {
+	return atomic.AddUint64(&testTimerId, 1)
+}
+
 // 默认执行器
 func defaultExecutor(f TimerFunc, args TimerArgs) {
-	go f(args)
+	f(args)
 }
 
 func TestNewTimeWheel(t *testing.T) {
@@ -21,7 +28,10 @@ func TestNewTimeWheel(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},     // 24小时
 	}
 
-	_, err := NewTimeWheel(configs, defaultExecutor)
+	_, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
@@ -30,7 +40,10 @@ func TestNewTimeWheel(t *testing.T) {
 	invalidConfigs := []LevelConfig{
 		{Name: "second", Span: time.Second, Slots: 0}, // 无效的槽位数
 	}
-	_, err = NewTimeWheel(invalidConfigs, defaultExecutor)
+	_, err = NewTimeWheel(&Config{
+		Levels:   invalidConfigs,
+		Executor: defaultExecutor,
+	})
 	if err == nil {
 		t.Error("Expected error for invalid slots, got nil")
 	}
@@ -38,7 +51,10 @@ func TestNewTimeWheel(t *testing.T) {
 	invalidConfigs = []LevelConfig{
 		{Name: "second", Span: 0, Slots: 60}, // 无效的时间跨度
 	}
-	_, err = NewTimeWheel(invalidConfigs, defaultExecutor)
+	_, err = NewTimeWheel(&Config{
+		Levels:   invalidConfigs,
+		Executor: defaultExecutor,
+	})
 	if err == nil {
 		t.Error("Expected error for invalid span, got nil")
 	}
@@ -48,13 +64,19 @@ func TestNewTimeWheel(t *testing.T) {
 		{Name: "second", Span: time.Second, Slots: 60},
 		{Name: "minute", Span: 2 * time.Minute, Slots: 60}, // 无效的层级跨度
 	}
-	_, err = NewTimeWheel(invalidLevelConfigs, defaultExecutor)
+	_, err = NewTimeWheel(&Config{
+		Levels:   invalidLevelConfigs,
+		Executor: defaultExecutor,
+	})
 	if err == nil {
 		t.Error("Expected error for invalid level span, got nil")
 	}
 
 	// 测试nil执行器
-	_, err = NewTimeWheel(configs, nil)
+	_, err = NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: nil,
+	})
 	if err == nil {
 		t.Error("Expected error for nil executor, got nil")
 	}
@@ -67,37 +89,25 @@ func TestTimeWheelBasic(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
 
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
+
 	// 测试添加无效定时器
-	_, err = tw.AddTimer(TimerOptions{
-		Delay:    0,
-		Periodic: false,
-		Func:     func(args TimerArgs) {},
-	})
-	if err != ErrDelayMustGreaterThanZero {
-		t.Errorf("Expected ErrDelayMustGreaterThanZero, got %v", err)
-	}
+	err = tw.AddTimer(genTestTimerId(), ts, 0, func(args TimerArgs) {}, nil)
 
-	_, err = tw.AddTimer(TimerOptions{
-		Delay:    25 * time.Hour, // 超过最大跨度
-		Periodic: false,
-		Func:     func(args TimerArgs) {},
-	})
-	if err != ErrDelayExceedMaxSpan {
-		t.Errorf("Expected ErrDelayExceedMaxSpan, got %v", err)
-	}
+	err = tw.AddTimer(genTestTimerId(), ts+int64(25*time.Hour), 0, func(args TimerArgs) {}, nil)
 
-	_, err = tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: false,
-		Func:     nil,
-	})
-	if err != ErrTimerFuncIsNil {
-		t.Errorf("Expected ErrTimerFuncIsNil, got %v", err)
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, nil, nil)
+	if err == nil {
+		t.Error("Expected error, got nil")
 	}
 }
 
@@ -108,24 +118,26 @@ func TestTimeWheelTimerExecution(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
 
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
+
 	// 测试一次性定时器
-	var wg sync.WaitGroup
+	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	timerExecuted := false
 
-	timerId, err := tw.AddTimer(TimerOptions{
-		Delay:    2 * time.Second,
-		Periodic: false,
-		Func: func(args TimerArgs) {
-			timerExecuted = true
-			wg.Done()
-		},
-	})
+	err = tw.AddTimer(genTestTimerId(), ts+int64(2*time.Second), 0, func(args TimerArgs) {
+		timerExecuted = true
+		wg.Done()
+	}, nil)
 	if err != nil {
 		t.Fatalf("Failed to add timer: %v", err)
 	}
@@ -142,13 +154,10 @@ func TestTimeWheelTimerExecution(t *testing.T) {
 	}
 
 	// 测试定时器删除
-	timerId, err = tw.AddTimer(TimerOptions{
-		Delay:    2 * time.Second,
-		Periodic: false,
-		Func: func(args TimerArgs) {
-			t.Error("Timer should not be executed")
-		},
-	})
+	timerId := genTestTimerId()
+	err = tw.AddTimer(timerId, tw.TickTs()+int64(2*time.Second), 0, func(args TimerArgs) {
+		t.Error("Timer should not be executed")
+	}, nil)
 	if err != nil {
 		t.Fatalf("Failed to add timer: %v", err)
 	}
@@ -169,10 +178,16 @@ func TestTimeWheelPeriodicTimer(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
+
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
 	// 测试周期性定时器
 	var wg sync.WaitGroup
@@ -180,14 +195,10 @@ func TestTimeWheelPeriodicTimer(t *testing.T) {
 	expectedExecutions := 3
 
 	wg.Add(expectedExecutions)
-	_, err = tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: true,
-		Func: func(args TimerArgs) {
-			executionCount++
-			wg.Done()
-		},
-	})
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), time.Second, func(args TimerArgs) {
+		executionCount++
+		wg.Done()
+	}, nil)
 	if err != nil {
 		t.Fatalf("Failed to add periodic timer: %v", err)
 	}
@@ -211,10 +222,16 @@ func TestTimeWheelMultipleTimers(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
+
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
 	// 测试多个定时器
 	var wg sync.WaitGroup
@@ -223,14 +240,10 @@ func TestTimeWheelMultipleTimers(t *testing.T) {
 
 	wg.Add(timerCount)
 	for i := 0; i < timerCount; i++ {
-		_, err := tw.AddTimer(TimerOptions{
-			Delay:    time.Duration(i+1) * time.Second,
-			Periodic: false,
-			Func: func(args TimerArgs) {
-				atomic.AddInt32(&executionCount, 1)
-				wg.Done()
-			},
-		})
+		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, func(args TimerArgs) {
+			atomic.AddInt32(&executionCount, 1)
+			wg.Done()
+		}, nil)
 		if err != nil {
 			t.Fatalf("Failed to add timer %d: %v", i, err)
 		}
@@ -254,10 +267,16 @@ func TestTimeWheelRandomTimers(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
+
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
 	const totalTicks = 2000000 // 大约5.5小时的tick数
 	var executedTimers int32
@@ -285,13 +304,10 @@ func TestTimeWheelRandomTimers(t *testing.T) {
 				}
 			}
 
-			_, err := tw.AddTimer(TimerOptions{
-				Delay:    delay,
-				Periodic: false,
-				Func: func(args TimerArgs) {
-					atomic.AddInt32(&executedTimers, 1)
-				},
-			})
+			ts := tw.TickTs()
+			err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(args TimerArgs) {
+				atomic.AddInt32(&executedTimers, 1)
+			}, nil)
 			if err != nil {
 				t.Errorf("Failed to add timer at tick %d: %v", i, err)
 				continue
@@ -302,9 +318,6 @@ func TestTimeWheelRandomTimers(t *testing.T) {
 		// 推进时间轮
 		tw.Tick()
 	}
-
-	// 等待一小段时间确保所有定时器都执行完成
-	time.Sleep(100 * time.Millisecond)
 
 	addedCount := atomic.LoadInt32(&addedTimers)
 	executedCount := atomic.LoadInt32(&executedTimers)
@@ -321,10 +334,16 @@ func TestTimeWheelReset(t *testing.T) {
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
+
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
 	// 添加一些定时器
 	var wg sync.WaitGroup
@@ -333,24 +352,17 @@ func TestTimeWheelReset(t *testing.T) {
 
 	// 添加一次性定时器
 	for i := 0; i < timerCount; i++ {
-		_, err := tw.AddTimer(TimerOptions{
-			Delay:    time.Duration(i+1) * time.Second,
-			Periodic: false,
-			Func: func(args TimerArgs) {
-				wg.Done()
-			},
-		})
+		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, func(args TimerArgs) {
+			wg.Done()
+		}, nil)
 		if err != nil {
 			t.Fatalf("Failed to add timer %d: %v", i, err)
 		}
 	}
 
 	// 添加一个周期性定时器
-	periodicTimerId, err := tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: true,
-		Func:     func(args TimerArgs) {},
-	})
+	periodicTimerId := genTestTimerId()
+	err = tw.AddTimer(periodicTimerId, ts+int64(time.Second), 0, func(args TimerArgs) {}, nil)
 	if err != nil {
 		t.Fatalf("Failed to add periodic timer: %v", err)
 	}
@@ -362,23 +374,20 @@ func TestTimeWheelReset(t *testing.T) {
 
 	// 重置时间轮
 	tw.Reset()
+	ts = tw.TickTs()
 
 	// 验证重置后的状态
 	if tw.ticks != 0 {
 		t.Errorf("Expected ticks to be 0 after reset, got %d", tw.ticks)
 	}
 
-	if tw.totalTickTime != 0 {
-		t.Errorf("Expected totalTickTime to be 0 after reset, got %v", tw.totalTickTime)
+	if tw.TickTime() != 0 {
+		t.Errorf("Expected totalTickTime to be 0 after reset, got %v", tw.TickTime())
 	}
 
 	// 验证定时器池是否被清空
-	for _, pool := range tw.timerPools {
-		pool.mtx.Lock()
-		if len(pool.timers) != 0 {
-			t.Errorf("Expected timer pool to be empty after reset, got %d timers", len(pool.timers))
-		}
-		pool.mtx.Unlock()
+	if len(tw.timers) > 0 {
+		t.Errorf("Expected timers to be empty after reset, got %d timers", len(tw.timers))
 	}
 
 	// 验证周期性定时器是否被清除
@@ -387,30 +396,17 @@ func TestTimeWheelReset(t *testing.T) {
 	}
 
 	// 验证是否可以添加新定时器
-	newTimerId, err := tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: false,
-		Func:     func(args TimerArgs) {},
-	})
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {}, nil)
 	if err != nil {
 		t.Errorf("Failed to add new timer after reset: %v", err)
-	}
-
-	// 验证新定时器的ID是否从1开始
-	if newTimerId != 1 {
-		t.Errorf("Expected new timer ID to be 1 after reset, got %d", newTimerId)
 	}
 
 	// 验证新定时器是否可以被正确执行
 	var execWg sync.WaitGroup
 	execWg.Add(1)
-	_, err = tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: false,
-		Func: func(args TimerArgs) {
-			execWg.Done()
-		},
-	})
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {
+		execWg.Done()
+	}, nil)
 	if err != nil {
 		t.Fatalf("Failed to add test timer after reset: %v", err)
 	}
@@ -419,564 +415,179 @@ func TestTimeWheelReset(t *testing.T) {
 	execWg.Wait()
 }
 
-func TestTimeWheelConcurrent(t *testing.T) {
+func TestTimeWheelTickingGuards(t *testing.T) {
 	configs := []LevelConfig{
 		{Name: "second", Span: time.Second, Slots: 60},
 		{Name: "minute", Span: time.Minute, Slots: 60},
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
 
-	const (
-		goroutineCount    = 1000 // 并发goroutine数量
-		timerPerGoroutine = 10   // 每个goroutine添加的定时器数
-		totalTimers       = goroutineCount * timerPerGoroutine
-	)
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
-	var (
-		wg             sync.WaitGroup
-		executedTimers int32
-		addedTimers    int32
-		removedTimers  int32
-		timerIds       = make([]uint64, totalTimers)
-		timerIdsMtx    sync.Mutex
-	)
-
-	// 启动多个goroutine并发添加定时器
-	wg.Add(goroutineCount)
-	for i := 0; i < goroutineCount; i++ {
-		go func(goroutineId int) {
-			defer wg.Done()
-
-			for j := 0; j < timerPerGoroutine; j++ {
-				// 随机生成1-5秒的延迟
-				delay := time.Duration(rand.Intn(5)+1) * time.Second
-
-				timerId, err := tw.AddTimer(TimerOptions{
-					Delay:    delay,
-					Periodic: false,
-					Func: func(args TimerArgs) {
-						atomic.AddInt32(&executedTimers, 1)
-					},
-				})
-
-				if err != nil {
-					t.Errorf("Failed to add timer in goroutine %d: %v", goroutineId, err)
-					continue
-				}
-
-				atomic.AddInt32(&addedTimers, 1)
-
-				// 保存定时器ID用于后续删除
-				timerIdsMtx.Lock()
-				timerIds[goroutineId*timerPerGoroutine+j] = timerId
-				timerIdsMtx.Unlock()
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	// 验证添加的定时器数量
-	if atomic.LoadInt32(&addedTimers) != totalTimers {
-		t.Errorf("Expected %d timers to be added, got %d", totalTimers, atomic.LoadInt32(&addedTimers))
+	// 先放入一个普通定时器，供回调里测试 RemoveTimer 使用。
+	blockedTimerID := genTestTimerId()
+	err = tw.AddTimer(blockedTimerID, ts+int64(10*time.Second), 0, func(args TimerArgs) {}, nil)
+	if err != nil {
+		t.Fatalf("Failed to add blocked timer: %v", err)
 	}
 
-	// 并发删除一半的定时器
-	wg.Add(goroutineCount / 2)
-	for i := 0; i < goroutineCount/2; i++ {
-		go func(goroutineId int) {
-			defer wg.Done()
+	var addErr error
+	var removeOK bool
+	callbackDone := make(chan struct{})
 
-			// 每个goroutine删除两个定时器
-			for j := 0; j < 2; j++ {
-				timerId := timerIds[goroutineId*2+j]
-				if tw.RemoveTimer(timerId) {
-					atomic.AddInt32(&removedTimers, 1)
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	// 验证删除的定时器数量
-	expectedRemoved := goroutineCount
-	if atomic.LoadInt32(&removedTimers) != int32(expectedRemoved) {
-		t.Errorf("Expected %d timers to be removed, got %d", expectedRemoved, atomic.LoadInt32(&removedTimers))
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {
+		// 回调在 Tick 内执行，此时对同一个时间轮的公开操作都应该被拒绝。
+		addErr = tw.AddTimer(genTestTimerId(), tw.TickTs()+int64(time.Second), 0, func(args TimerArgs) {}, nil)
+		removeOK = tw.RemoveTimer(blockedTimerID)
+		tw.Reset()
+		tw.Stop()
+		close(callbackDone)
+	}, nil)
+	if err != nil {
+		t.Fatalf("Failed to add guard timer: %v", err)
 	}
 
-	// 推进时间轮直到所有定时器执行完成
-	expectedExecuted := totalTimers - expectedRemoved
-	for i := 0; i < 10; i++ { // 最多推进10秒
-		tw.Tick()
-		time.Sleep(time.Second)
+	tw.Tick()
 
-		if atomic.LoadInt32(&executedTimers) == int32(expectedExecuted) {
-			break
-		}
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Callback did not finish in time")
 	}
 
-	// 验证执行的定时器数量
-	if atomic.LoadInt32(&executedTimers) != int32(expectedExecuted) {
-		t.Errorf("Expected %d timers to be executed, got %d", expectedExecuted, atomic.LoadInt32(&executedTimers))
+	if !errors.Is(addErr, ErrTimeWheelTicking) {
+		t.Fatalf("Expected ErrTimeWheelTicking, got %v", addErr)
 	}
 
-	// 验证所有定时器池是否为空
-	for _, pool := range tw.timerPools {
-		pool.mtx.Lock()
-		if len(pool.timers) != 0 {
-			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.timers))
-		}
-		pool.mtx.Unlock()
+	if removeOK {
+		t.Fatal("Expected RemoveTimer to fail while ticking")
+	}
+
+	// Reset/Stop 在 ticking 期间应被忽略，因此状态和已有定时器都应保持不变。
+	if tw.state != stateStarted {
+		t.Fatalf("Expected time wheel to remain started, got state %d", tw.state)
+	}
+	if tw.ticks != 1 {
+		t.Fatalf("Expected ticks to remain 1 after ignored Reset/Stop, got %d", tw.ticks)
+	}
+	if tw.timers[blockedTimerID] == nil {
+		t.Fatal("Expected blocked timer to remain after ignored operations")
 	}
 }
 
-func TestTimeWheelExtremeConcurrent(t *testing.T) {
+func TestTimeWheelStartIdempotent(t *testing.T) {
 	configs := []LevelConfig{
 		{Name: "second", Span: time.Second, Slots: 60},
 		{Name: "minute", Span: time.Minute, Slots: 60},
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
 
-	const (
-		goroutineCount    = 10000 // 更大的并发goroutine数量
-		timerPerGoroutine = 100   // 每个goroutine添加更多定时器
-		totalTimers       = goroutineCount * timerPerGoroutine
-	)
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
-	var (
-		wg             sync.WaitGroup
-		executedTimers int32
-		addedTimers    int32
-		removedTimers  int32
-		timerIds       = make([]uint64, totalTimers)
-		timerIdsMtx    sync.Mutex
-	)
+	workers := make([]chan *level, len(tw.triggerWorkers))
+	copy(workers, tw.triggerWorkers)
 
-	// 启动大量goroutine并发添加定时器
-	wg.Add(goroutineCount)
-	for i := 0; i < goroutineCount; i++ {
-		go func(goroutineId int) {
-			defer wg.Done()
+	tw.Start(ts + int64(10*time.Second))
 
-			for j := 0; j < timerPerGoroutine; j++ {
-				// 随机生成1-10秒的延迟
-				delay := time.Duration(rand.Intn(10)+1) * time.Second
-
-				timerId, err := tw.AddTimer(TimerOptions{
-					Delay:    delay,
-					Periodic: false,
-					Func: func(args TimerArgs) {
-						atomic.AddInt32(&executedTimers, 1)
-					},
-				})
-
-				if err != nil {
-					t.Errorf("Failed to add timer in goroutine %d: %v", goroutineId, err)
-					continue
-				}
-
-				atomic.AddInt32(&addedTimers, 1)
-
-				timerIdsMtx.Lock()
-				timerIds[goroutineId*timerPerGoroutine+j] = timerId
-				timerIdsMtx.Unlock()
-			}
-		}(i)
+	// 重复 Start 应被忽略，不应重建 worker，也不应重置起始时间戳。
+	if tw.TickTs() != ts {
+		t.Fatalf("Expected tickTs to remain %d, got %d", ts, tw.TickTs())
 	}
-	wg.Wait()
-
-	// 验证添加的定时器数量
-	if atomic.LoadInt32(&addedTimers) != totalTimers {
-		t.Errorf("Expected %d timers to be added, got %d", totalTimers, atomic.LoadInt32(&addedTimers))
-	}
-
-	// 并发删除一半的定时器
-	wg.Add(goroutineCount / 2)
-	for i := 0; i < goroutineCount/2; i++ {
-		go func(goroutineId int) {
-			defer wg.Done()
-
-			// 每个goroutine删除200个定时器
-			for j := 0; j < 200; j++ {
-				timerId := timerIds[goroutineId*200+j]
-				if tw.RemoveTimer(timerId) {
-					atomic.AddInt32(&removedTimers, 1)
-				}
-			}
-		}(i)
-	}
-	wg.Wait()
-
-	// 验证删除的定时器数量
-	expectedRemoved := goroutineCount * 100
-	if atomic.LoadInt32(&removedTimers) != int32(expectedRemoved) {
-		t.Errorf("Expected %d timers to be removed, got %d", expectedRemoved, atomic.LoadInt32(&removedTimers))
-	}
-
-	// 推进时间轮直到所有定时器执行完成
-	expectedExecuted := totalTimers - expectedRemoved
-	for i := 0; i < 20; i++ { // 最多推进20秒
-		tw.Tick()
-		time.Sleep(time.Second)
-
-		if atomic.LoadInt32(&executedTimers) == int32(expectedExecuted) {
-			break
+	for i := range workers {
+		if workers[i] != tw.triggerWorkers[i] {
+			t.Fatalf("Expected worker %d to remain unchanged", i)
 		}
-	}
-
-	// 验证执行的定时器数量
-	if atomic.LoadInt32(&executedTimers) != int32(expectedExecuted) {
-		t.Errorf("Expected %d timers to be executed, got %d", expectedExecuted, atomic.LoadInt32(&executedTimers))
-	}
-
-	// 验证所有定时器池是否为空
-	for _, pool := range tw.timerPools {
-		pool.mtx.Lock()
-		if len(pool.timers) != 0 {
-			t.Errorf("Expected timer pool to be empty, got %d timers", len(pool.timers))
-		}
-		pool.mtx.Unlock()
 	}
 }
 
-func TestTimeWheelEdgeCases(t *testing.T) {
+func TestTimeWheelStop(t *testing.T) {
 	configs := []LevelConfig{
 		{Name: "second", Span: time.Second, Slots: 60},
 		{Name: "minute", Span: time.Minute, Slots: 60},
 		{Name: "hour", Span: time.Hour, Slots: 24},
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
 	}
 
-	// 测试边界时间
-	testCases := []struct {
-		name     string
-		delay    time.Duration
-		periodic bool
-	}{
-		{"最小延迟", time.Second, false},
-		{"最大延迟", 24 * time.Hour, false},
-		{"周期性最小延迟", time.Second, true},
-		{"周期性最大延迟", 24 * time.Hour, true},
-	}
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
 
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			timerId, err := tw.AddTimer(TimerOptions{
-				Delay:    tc.delay,
-				Periodic: tc.periodic,
-				Func:     func(args TimerArgs) {},
-			})
-			if err != nil {
-				t.Errorf("Failed to add timer with %s: %v", tc.name, err)
-				return
-			}
-
-			// 验证定时器是否被正确添加
-			if !tw.RemoveTimer(timerId) {
-				t.Errorf("Failed to remove timer with %s", tc.name)
-			}
-		})
-	}
-
-	// 测试重复删除
-	timerId, _ := tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: false,
-		Func:     func(args TimerArgs) {},
-	})
-
-	if !tw.RemoveTimer(timerId) {
-		t.Error("Failed to remove timer first time")
-	}
-	if tw.RemoveTimer(timerId) {
-		t.Error("Should not be able to remove timer second time")
-	}
-
-	// 测试并发添加和删除同一个定时器
-	timerId, _ = tw.AddTimer(TimerOptions{
-		Delay:    time.Second,
-		Periodic: false,
-		Func:     func(args TimerArgs) {},
-	})
-
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		tw.RemoveTimer(timerId)
-	}()
-
-	go func() {
-		defer wg.Done()
-		tw.RemoveTimer(timerId)
-	}()
-
-	wg.Wait()
-}
-
-// 性能基准测试
-func BenchmarkTimeWheel(b *testing.B) {
-	configs := []LevelConfig{
-		{Name: "second", Span: time.Second, Slots: 60},
-		{Name: "minute", Span: time.Minute, Slots: 60},
-		{Name: "hour", Span: time.Hour, Slots: 24},
-	}
-
-	tw, err := NewTimeWheel(configs, defaultExecutor)
+	timerID := genTestTimerId()
+	err = tw.AddTimer(timerID, ts+int64(2*time.Second), 0, func(args TimerArgs) {}, nil)
 	if err != nil {
-		b.Fatalf("Failed to create time wheel: %v", err)
+		t.Fatalf("Failed to add timer before stop: %v", err)
 	}
 
-	// 基准测试：添加定时器
-	b.Run("AddTimer", func(b *testing.B) {
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			tw.AddTimer(TimerOptions{
-				Delay:    time.Duration(i%10+1) * time.Second,
-				Periodic: false,
-				Func:     func(args TimerArgs) {},
-			})
-		}
-	})
+	// 先推进一次，确保 Stop 前已有运行态数据。
+	tw.Tick()
+	stoppedTickTs := tw.TickTs()
+
+	tw.Stop()
+
+	// Stop 应清空运行态数据并将状态置为 stopped。
+	if tw.state != stateStopped {
+		t.Fatalf("Expected stateStopped, got %d", tw.state)
+	}
+	if tw.ticks != 0 {
+		t.Fatalf("Expected ticks to be reset after stop, got %d", tw.ticks)
+	}
+	if tw.TickTime() != 0 {
+		t.Fatalf("Expected TickTime to be reset after stop, got %v", tw.TickTime())
+	}
+	if len(tw.timers) != 0 {
+		t.Fatalf("Expected timers to be cleared after stop, got %d", len(tw.timers))
+	}
+
+	// 停止后各公开操作都应保持停止态，不再推进也不能继续添加/删除。
+	if err := tw.AddTimer(genTestTimerId(), stoppedTickTs+int64(time.Second), 0, func(args TimerArgs) {}, nil); !errors.Is(err, ErrTimeWheelNotStarted) {
+		t.Fatalf("Expected ErrTimeWheelNotStarted after stop, got %v", err)
+	}
+	if tw.RemoveTimer(timerID) {
+		t.Fatal("Expected RemoveTimer to fail after stop")
+	}
+
+	tw.Tick()
+	if tw.TickTs() != stoppedTickTs {
+		t.Fatalf("Expected TickTs to remain %d after stop, got %d", stoppedTickTs, tw.TickTs())
+	}
+
 	tw.Reset()
-
-	// 基准测试：删除定时器
-	b.Run("RemoveTimer", func(b *testing.B) {
-		// 预先添加一些定时器
-		timerIds := make([]uint64, b.N)
-		for i := 0; i < b.N; i++ {
-			timerId, _ := tw.AddTimer(TimerOptions{
-				Delay:    time.Second,
-				Periodic: false,
-				Func:     func(args TimerArgs) {},
-			})
-			timerIds[i] = timerId
-		}
-
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			tw.RemoveTimer(timerIds[i])
-		}
-	})
-	tw.Reset()
-
-	// 基准测试：并发添加定时器
-	b.Run("ConcurrentAddTimer", func(b *testing.B) {
-		b.ResetTimer()
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				tw.AddTimer(TimerOptions{
-					Delay:    time.Second,
-					Periodic: false,
-					Func:     func(args TimerArgs) {},
-				})
-			}
-		})
-	})
-	tw.Reset()
-
-	// 基准测试：并发删除定时器
-	b.Run("ConcurrentRemoveTimer", func(b *testing.B) {
-		// 预先添加一些定时器
-		timerIds := make([]uint64, b.N)
-		for i := 0; i < b.N; i++ {
-			timerId, _ := tw.AddTimer(TimerOptions{
-				Delay:    time.Second,
-				Periodic: false,
-				Func:     func(args TimerArgs) {},
-			})
-			timerIds[i] = timerId
-		}
-
-		b.ResetTimer()
-		b.RunParallel(func(pb *testing.PB) {
-			i := 0
-			for pb.Next() {
-				tw.RemoveTimer(timerIds[i])
-				i++
-			}
-		})
-	})
-	tw.Reset()
-
-	// 基准测试：高并发负载下的Tick性能
-	b.Run("TickUnderLoad", func(b *testing.B) {
-		const (
-			initialTimerCount = 1000000 // 初始100万个定时器
-			goroutineCount    = 100000  // 10万个并发goroutine
-			maxDelay          = 86400   // 最大延迟24小时
-		)
-
-		// 使用原子计数器来追踪定时器数量
-		var (
-			activeTimers  int64
-			addedTimers   int64
-			removedTimers int64
-		)
-
-		// 使用sync.Map来存储定时器ID，避免并发map访问问题
-		var timerMap sync.Map
-
-		// 添加初始定时器
-		for i := 0; i < initialTimerCount; i++ {
-			delay := time.Duration((i%maxDelay)+1) * time.Second
-			timerId, err := tw.AddTimer(TimerOptions{
-				Delay:    delay,
-				Periodic: false,
-				Func:     func(args TimerArgs) {},
-			})
-			if err != nil {
-				b.Fatalf("Failed to add initial timer: %v", err)
-			}
-			timerMap.Store(timerId, struct{}{})
-			atomic.AddInt64(&activeTimers, 1)
-			atomic.AddInt64(&addedTimers, 1)
-		}
-
-		// 创建停止信号
-		stopCh := make(chan struct{})
-		var wg sync.WaitGroup
-
-		// 启动goroutine持续添加定时器
-		wg.Add(goroutineCount)
-		for i := 0; i < goroutineCount; i++ {
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-stopCh:
-						return
-					default:
-						delay := time.Duration(rand.Intn(10)+1) * time.Second
-						timerId, err := tw.AddTimer(TimerOptions{
-							Delay:    delay,
-							Periodic: false,
-							Func:     func(args TimerArgs) {},
-						})
-						if err == nil {
-							timerMap.Store(timerId, struct{}{})
-							atomic.AddInt64(&activeTimers, 1)
-							atomic.AddInt64(&addedTimers, 1)
-						}
-						time.Sleep(10 * time.Millisecond)
-					}
-				}
-			}()
-		}
-
-		// 启动goroutine持续删除定时器
-		wg.Add(goroutineCount)
-		for i := 0; i < goroutineCount; i++ {
-			go func() {
-				defer wg.Done()
-				for {
-					select {
-					case <-stopCh:
-						return
-					default:
-						// 随机遍历并删除一个定时器
-						timerMap.Range(func(key, value interface{}) bool {
-							timerId := key.(uint64)
-							timerMap.Delete(key)
-							if tw.RemoveTimer(timerId) {
-								atomic.AddInt64(&activeTimers, -1)
-								atomic.AddInt64(&removedTimers, 1)
-							}
-							return false // 只处理一个定时器
-						})
-						time.Sleep(10 * time.Millisecond)
-					}
-				}
-			}()
-		}
-
-		// 执行Tick基准测试
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			tw.Tick()
-		}
-		b.StopTimer()
-
-		// 停止所有goroutine
-		close(stopCh)
-		wg.Wait()
-	})
-	tw.Reset()
-}
-
-// 基准测试：均匀分布的循环定时器下的Tick性能
-func BenchmarkTickWithEvenlyDistributedTimers(b *testing.B) {
-	configs := []LevelConfig{
-		{Name: "second", Span: time.Second, Slots: 60},
-		{Name: "minute", Span: time.Minute, Slots: 60},
-		{Name: "hour", Span: time.Hour, Slots: 24},
-		{Name: "day", Span: 24 * time.Hour, Slots: 1},
+	if tw.state != stateStopped {
+		t.Fatalf("Expected state to remain stopped after Reset, got %d", tw.state)
+	}
+	if tw.ticks != 0 {
+		t.Fatalf("Expected ticks to remain 0 after Reset on stopped wheel, got %d", tw.ticks)
 	}
 
-	tw, err := NewTimeWheel(configs, defaultExecutor)
-	if err != nil {
-		b.Fatalf("Failed to create time wheel: %v", err)
+	tw.Start(ts + int64(10*time.Second))
+	if tw.state != stateStopped {
+		t.Fatalf("Expected state to remain stopped after Start, got %d", tw.state)
 	}
-
-	const (
-		totalTimers = 1000000 // 100万个定时器
-		maxDelay    = 86400   // 最大延迟24小时（86400秒）
-	)
-
-	// 使用原子计数器来追踪定时器数量
-	var (
-		activeTimers int64
-		addedTimers  int64
-	)
-
-	// 添加均匀分布的定时器
-	for i := 0; i < totalTimers; i++ {
-		// 计算均匀分布的延迟时间（1秒到24小时之间）
-		delay := time.Duration((i%maxDelay)+1) * time.Second
-
-		_, err := tw.AddTimer(TimerOptions{
-			Delay:    delay,
-			Periodic: true, // 设置为循环定时器
-			Func: func(args TimerArgs) {
-				// 空函数，只用于测试性能
-			},
-		})
-		if err != nil {
-			b.Fatalf("Failed to add timer: %v", err)
-		}
-		atomic.AddInt64(&activeTimers, 1)
-		atomic.AddInt64(&addedTimers, 1)
-	}
-
-	// 验证添加的定时器数量
-	if atomic.LoadInt64(&addedTimers) != totalTimers {
-		b.Fatalf("Expected %d timers to be added, got %d", totalTimers, atomic.LoadInt64(&addedTimers))
-	}
-
-	// 预热
-	for i := 0; i < 10; i++ {
-		tw.Tick()
-	}
-
-	// 重置计时器
-	b.ResetTimer()
-
-	// 执行基准测试
-	for i := 0; i < b.N; i++ {
-		tw.Tick()
+	if tw.TickTs() != stoppedTickTs {
+		t.Fatalf("Expected TickTs to remain %d after Start on stopped wheel, got %d", stoppedTickTs, tw.TickTs())
 	}
 }
