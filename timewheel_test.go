@@ -591,3 +591,53 @@ func TestTimeWheelStop(t *testing.T) {
 		t.Fatalf("Expected TickTs to remain %d after Start on stopped wheel, got %d", stoppedTickTs, tw.TickTs())
 	}
 }
+
+func TestTimeWheelTimerExceedsWheelLimit(t *testing.T) {
+	configs := []LevelConfig{
+		{Name: "1ms", Span: time.Millisecond, Slots: 10},
+		{Name: "10ms", Span: 10 * time.Millisecond, Slots: 10},
+		{Name: "100ms", Span: 100 * time.Millisecond, Slots: 10},
+	}
+
+	tw, err := NewTimeWheel(&Config{
+		Levels:   configs,
+		Executor: defaultExecutor,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create time wheel: %v", err)
+	}
+
+	ts := time.Now().UnixNano()
+	tw.Start(ts)
+
+	// 顶层时间轮单轮容量为 100ms * 10 = 1s。
+	// 这里故意设置一个远大于单轮上限的延迟，验证定时器经过多次重新分派后仍能正确触发。
+	delay := 3500 * time.Millisecond
+	expectedTicks := int(delay / time.Millisecond)
+
+	var fired bool
+	var firedTick int64
+
+	err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(args TimerArgs) {
+		fired = true
+		firedTick = tw.ticks
+	}, nil)
+	if err != nil {
+		t.Fatalf("Failed to add timer: %v", err)
+	}
+
+	for i := 0; i < expectedTicks-1; i++ {
+		tw.Tick()
+		if fired {
+			t.Fatalf("Timer fired too early at tick %d, expected tick %d", firedTick, expectedTicks)
+		}
+	}
+
+	tw.Tick()
+	if !fired {
+		t.Fatalf("Expected timer to fire after %d ticks", expectedTicks)
+	}
+	if firedTick != int64(expectedTicks) {
+		t.Fatalf("Expected timer to fire at tick %d, got %d", expectedTicks, firedTick)
+	}
+}
