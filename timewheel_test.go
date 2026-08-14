@@ -11,13 +11,24 @@ import (
 
 var testTimerId uint64
 
+type testTimerValue struct {
+	name   string
+	onFire func(Timer)
+}
+
 func genTestTimerId() TimerID {
 	return atomic.AddUint64(&testTimerId, 1)
 }
 
-// 默认执行器
-func defaultExecutor(f TimerFunc, args TimerArgs) {
-	f(args)
+// 默认执行器会调用以函数形式存放在 Value 中的测试回调.
+func defaultCallback(timer Timer) {
+	if callback, ok := timer.Value.(func(Timer)); ok {
+		callback(timer)
+		return
+	}
+	if value, ok := timer.Value.(*testTimerValue); ok && value.onFire != nil {
+		value.onFire(timer)
+	}
 }
 
 func TestNewTimeWheel(t *testing.T) {
@@ -30,7 +41,7 @@ func TestNewTimeWheel(t *testing.T) {
 
 	_, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -42,7 +53,7 @@ func TestNewTimeWheel(t *testing.T) {
 	}
 	_, err = NewTimeWheel(&Config{
 		Levels:   invalidConfigs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err == nil {
 		t.Error("Expected error for invalid slots, got nil")
@@ -53,7 +64,7 @@ func TestNewTimeWheel(t *testing.T) {
 	}
 	_, err = NewTimeWheel(&Config{
 		Levels:   invalidConfigs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err == nil {
 		t.Error("Expected error for invalid span, got nil")
@@ -66,7 +77,7 @@ func TestNewTimeWheel(t *testing.T) {
 	}
 	_, err = NewTimeWheel(&Config{
 		Levels:   invalidLevelConfigs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err == nil {
 		t.Error("Expected error for invalid level span, got nil")
@@ -75,10 +86,10 @@ func TestNewTimeWheel(t *testing.T) {
 	// 测试nil执行器
 	_, err = NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: nil,
+		Callback: nil,
 	})
 	if err == nil {
-		t.Error("Expected error for nil executor, got nil")
+		t.Error("Expected error for nil Callback, got nil")
 	}
 }
 
@@ -91,7 +102,7 @@ func TestTimeWheelBasic(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -100,14 +111,27 @@ func TestTimeWheelBasic(t *testing.T) {
 	ts := time.Now().UnixNano()
 	tw.Start(ts)
 
-	// 测试添加无效定时器
-	err = tw.AddTimer(genTestTimerId(), ts, 0, func(args TimerArgs) {}, nil)
+	// 测试添加定时器.
+	err = tw.AddTimer(genTestTimerId(), ts, 0, nil)
+	if err != nil {
+		t.Fatalf("Failed to add current timer: %v", err)
+	}
 
-	err = tw.AddTimer(genTestTimerId(), ts+int64(25*time.Hour), 0, func(args TimerArgs) {}, nil)
+	err = tw.AddTimer(genTestTimerId(), ts+int64(25*time.Hour), 0, nil)
+	if err != nil {
+		t.Fatalf("Failed to add far future timer: %v", err)
+	}
 
-	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, nil, nil)
+	// 测试重复的定时器ID.
+	timerID := genTestTimerId()
+	err = tw.AddTimer(timerID, ts+int64(time.Second), 0, nil)
+	if err != nil {
+		t.Fatalf("Failed to add first duplicate test timer: %v", err)
+	}
+
+	err = tw.AddTimer(timerID, ts+int64(2*time.Second), 0, nil)
 	if err == nil {
-		t.Error("Expected error, got nil")
+		t.Error("Expected duplicate timer id error, got nil")
 	}
 }
 
@@ -120,7 +144,7 @@ func TestTimeWheelTimerExecution(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -134,10 +158,10 @@ func TestTimeWheelTimerExecution(t *testing.T) {
 	wg.Add(1)
 	timerExecuted := false
 
-	err = tw.AddTimer(genTestTimerId(), ts+int64(2*time.Second), 0, func(args TimerArgs) {
+	err = tw.AddTimer(genTestTimerId(), ts+int64(2*time.Second), 0, func(timer Timer) {
 		timerExecuted = true
 		wg.Done()
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Failed to add timer: %v", err)
 	}
@@ -155,15 +179,23 @@ func TestTimeWheelTimerExecution(t *testing.T) {
 
 	// 测试定时器删除
 	timerId := genTestTimerId()
-	err = tw.AddTimer(timerId, tw.TickTs()+int64(2*time.Second), 0, func(args TimerArgs) {
-		t.Error("Timer should not be executed")
-	}, nil)
+	removedValue := &testTimerValue{
+		name: "removed-timer-value",
+		onFire: func(timer Timer) {
+			t.Error("Removed timer should not be executed")
+		},
+	}
+	err = tw.AddTimer(timerId, tw.TickTs()+int64(2*time.Second), 0, removedValue)
 	if err != nil {
 		t.Fatalf("Failed to add timer: %v", err)
 	}
 
-	if !tw.RemoveTimer(timerId) {
+	value, ok := tw.RemoveTimer(timerId)
+	if !ok {
 		t.Error("Failed to remove timer")
+	}
+	if value != removedValue {
+		t.Fatalf("Expected removed value %#v, got %#v", removedValue, value)
 	}
 
 	for i := 0; i < 2; i++ {
@@ -180,7 +212,7 @@ func TestTimeWheelPeriodicTimer(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -195,10 +227,10 @@ func TestTimeWheelPeriodicTimer(t *testing.T) {
 	expectedExecutions := 3
 
 	wg.Add(expectedExecutions)
-	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), time.Second, func(args TimerArgs) {
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), time.Second, func(timer Timer) {
 		executionCount++
 		wg.Done()
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Failed to add periodic timer: %v", err)
 	}
@@ -224,7 +256,7 @@ func TestTimeWheelMultipleTimers(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -240,10 +272,10 @@ func TestTimeWheelMultipleTimers(t *testing.T) {
 
 	wg.Add(timerCount)
 	for i := 0; i < timerCount; i++ {
-		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, func(args TimerArgs) {
+		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, func(timer Timer) {
 			atomic.AddInt32(&executionCount, 1)
 			wg.Done()
-		}, nil)
+		})
 		if err != nil {
 			t.Fatalf("Failed to add timer %d: %v", i, err)
 		}
@@ -269,7 +301,7 @@ func TestTimeWheelRandomTimers(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -305,9 +337,9 @@ func TestTimeWheelRandomTimers(t *testing.T) {
 			}
 
 			ts := tw.TickTs()
-			err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(args TimerArgs) {
+			err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(timer Timer) {
 				atomic.AddInt32(&executedTimers, 1)
-			}, nil)
+			})
 			if err != nil {
 				t.Errorf("Failed to add timer at tick %d: %v", i, err)
 				continue
@@ -336,7 +368,7 @@ func TestTimeWheelReset(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -345,24 +377,18 @@ func TestTimeWheelReset(t *testing.T) {
 	ts := time.Now().UnixNano()
 	tw.Start(ts)
 
-	// 添加一些定时器
-	var wg sync.WaitGroup
+	// 添加一些定时器.
 	timerCount := 5
-	wg.Add(timerCount)
-
-	// 添加一次性定时器
 	for i := 0; i < timerCount; i++ {
-		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, func(args TimerArgs) {
-			wg.Done()
-		}, nil)
+		err = tw.AddTimer(genTestTimerId(), ts+int64(i+1)*int64(time.Second), 0, nil)
 		if err != nil {
 			t.Fatalf("Failed to add timer %d: %v", i, err)
 		}
 	}
 
-	// 添加一个周期性定时器
+	// 添加一个周期性定时器.
 	periodicTimerId := genTestTimerId()
-	err = tw.AddTimer(periodicTimerId, ts+int64(time.Second), 0, func(args TimerArgs) {}, nil)
+	err = tw.AddTimer(periodicTimerId, ts+int64(time.Second), time.Second, nil)
 	if err != nil {
 		t.Fatalf("Failed to add periodic timer: %v", err)
 	}
@@ -381,8 +407,8 @@ func TestTimeWheelReset(t *testing.T) {
 		t.Errorf("Expected ticks to be 0 after reset, got %d", tw.ticks)
 	}
 
-	if tw.TickTime() != 0 {
-		t.Errorf("Expected totalTickTime to be 0 after reset, got %v", tw.TickTime())
+	if tw.TickDuration() != 0 {
+		t.Errorf("Expected totalTickDuration to be 0 after reset, got %v", tw.TickDuration())
 	}
 
 	// 验证定时器池是否被清空
@@ -391,12 +417,12 @@ func TestTimeWheelReset(t *testing.T) {
 	}
 
 	// 验证周期性定时器是否被清除
-	if tw.RemoveTimer(periodicTimerId) {
+	if _, ok := tw.RemoveTimer(periodicTimerId); ok {
 		t.Error("Expected periodic timer to be removed after reset")
 	}
 
 	// 验证是否可以添加新定时器
-	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {}, nil)
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, nil)
 	if err != nil {
 		t.Errorf("Failed to add new timer after reset: %v", err)
 	}
@@ -404,9 +430,9 @@ func TestTimeWheelReset(t *testing.T) {
 	// 验证新定时器是否可以被正确执行
 	var execWg sync.WaitGroup
 	execWg.Add(1)
-	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(timer Timer) {
 		execWg.Done()
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Failed to add test timer after reset: %v", err)
 	}
@@ -424,7 +450,7 @@ func TestTimeWheelTickingGuards(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -435,23 +461,25 @@ func TestTimeWheelTickingGuards(t *testing.T) {
 
 	// 先放入一个普通定时器，供回调里测试 RemoveTimer 使用。
 	blockedTimerID := genTestTimerId()
-	err = tw.AddTimer(blockedTimerID, ts+int64(10*time.Second), 0, func(args TimerArgs) {}, nil)
+	blockedValue := "blocked-timer"
+	err = tw.AddTimer(blockedTimerID, ts+int64(10*time.Second), 0, blockedValue)
 	if err != nil {
 		t.Fatalf("Failed to add blocked timer: %v", err)
 	}
 
 	var addErr error
+	var removeValue any
 	var removeOK bool
 	callbackDone := make(chan struct{})
 
-	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(args TimerArgs) {
+	err = tw.AddTimer(genTestTimerId(), ts+int64(time.Second), 0, func(timer Timer) {
 		// 回调在 Tick 内执行，此时对同一个时间轮的公开操作都应该被拒绝。
-		addErr = tw.AddTimer(genTestTimerId(), tw.TickTs()+int64(time.Second), 0, func(args TimerArgs) {}, nil)
-		removeOK = tw.RemoveTimer(blockedTimerID)
+		addErr = tw.AddTimer(genTestTimerId(), tw.TickTs()+int64(time.Second), 0, nil)
+		removeValue, removeOK = tw.RemoveTimer(blockedTimerID)
 		tw.Reset()
 		tw.Stop()
 		close(callbackDone)
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Failed to add guard timer: %v", err)
 	}
@@ -470,6 +498,9 @@ func TestTimeWheelTickingGuards(t *testing.T) {
 
 	if removeOK {
 		t.Fatal("Expected RemoveTimer to fail while ticking")
+	}
+	if removeValue != nil {
+		t.Fatalf("Expected RemoveTimer value to be nil while ticking, got %#v", removeValue)
 	}
 
 	// Reset/Stop 在 ticking 期间应被忽略，因此状态和已有定时器都应保持不变。
@@ -493,7 +524,7 @@ func TestTimeWheelStartIdempotent(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -527,7 +558,7 @@ func TestTimeWheelStop(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -537,7 +568,7 @@ func TestTimeWheelStop(t *testing.T) {
 	tw.Start(ts)
 
 	timerID := genTestTimerId()
-	err = tw.AddTimer(timerID, ts+int64(2*time.Second), 0, func(args TimerArgs) {}, nil)
+	err = tw.AddTimer(timerID, ts+int64(2*time.Second), 0, nil)
 	if err != nil {
 		t.Fatalf("Failed to add timer before stop: %v", err)
 	}
@@ -555,18 +586,18 @@ func TestTimeWheelStop(t *testing.T) {
 	if tw.ticks != 0 {
 		t.Fatalf("Expected ticks to be reset after stop, got %d", tw.ticks)
 	}
-	if tw.TickTime() != 0 {
-		t.Fatalf("Expected TickTime to be reset after stop, got %v", tw.TickTime())
+	if tw.TickDuration() != 0 {
+		t.Fatalf("Expected TickDuration to be reset after stop, got %v", tw.TickDuration())
 	}
 	if len(tw.timers) != 0 {
 		t.Fatalf("Expected timers to be cleared after stop, got %d", len(tw.timers))
 	}
 
 	// 停止后各公开操作都应保持停止态，不再推进也不能继续添加/删除。
-	if err := tw.AddTimer(genTestTimerId(), stoppedTickTs+int64(time.Second), 0, func(args TimerArgs) {}, nil); !errors.Is(err, ErrTimeWheelNotStarted) {
+	if err := tw.AddTimer(genTestTimerId(), stoppedTickTs+int64(time.Second), 0, nil); !errors.Is(err, ErrTimeWheelNotStarted) {
 		t.Fatalf("Expected ErrTimeWheelNotStarted after stop, got %v", err)
 	}
-	if tw.RemoveTimer(timerID) {
+	if _, ok := tw.RemoveTimer(timerID); ok {
 		t.Fatal("Expected RemoveTimer to fail after stop")
 	}
 
@@ -601,7 +632,7 @@ func TestTimeWheelTimerExceedsWheelLimit(t *testing.T) {
 
 	tw, err := NewTimeWheel(&Config{
 		Levels:   configs,
-		Executor: defaultExecutor,
+		Callback: defaultCallback,
 	})
 	if err != nil {
 		t.Fatalf("Failed to create time wheel: %v", err)
@@ -618,10 +649,10 @@ func TestTimeWheelTimerExceedsWheelLimit(t *testing.T) {
 	var fired bool
 	var firedTick int64
 
-	err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(args TimerArgs) {
+	err = tw.AddTimer(genTestTimerId(), ts+int64(delay), 0, func(timer Timer) {
 		fired = true
 		firedTick = tw.ticks
-	}, nil)
+	})
 	if err != nil {
 		t.Fatalf("Failed to add timer: %v", err)
 	}

@@ -20,6 +20,9 @@ import (
 )
 
 func main() {
+        var wg sync.WaitGroup
+        wg.Add(1)
+
 	config := &gtimewheel.Config{
 		Levels: []gtimewheel.LevelConfig{
 			{Name: "100ms", Span: 100 * time.Millisecond, Slots: 10},
@@ -27,9 +30,10 @@ func main() {
 			{Name: "m", Span: time.Minute, Slots: 60},
 			{Name: "h", Span: time.Hour, Slots: 24},
 		},
-		Executor: func(f gtimewheel.TimerFunc, args gtimewheel.TimerArgs) {
-			// 如需异步执行回调，可以在这里起 goroutine。
-			f(args)
+                Callback: func(timer gtimewheel.Timer) {
+                        // 如需异步处理定时器触发，可以在这里起 goroutine。
+                        log.Printf("timer %d fired, value=%v", timer.TID, timer.Value)
+                        wg.Done()
 		},
 	}
 
@@ -42,13 +46,7 @@ func main() {
 	tw.Start(ts)
 	defer tw.Stop()
 
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	err = tw.AddTimer(1, ts+int64(time.Second), 0, func(args gtimewheel.TimerArgs) {
-		log.Printf("timer %d fired", args.TID)
-		wg.Done()
-	}, nil)
+        err = tw.AddTimer(1, ts+int64(time.Second), 0, "demo-timer")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -79,8 +77,9 @@ func waitDone(wg *sync.WaitGroup) <-chan struct{} {
 ## API 说明
 
 - `Start(ts)`：启动时间轮，`ts` 为纳秒时间戳。
-- `AddTimer(tid, ts, period, f, args)`：添加定时器。
+- `AddTimer(tid, ts, period, value)`：添加定时器。
 - `period == 0` 表示一次性定时器，`period > 0` 表示周期性定时器。
+- `Callback` 会在定时器触发时收到一个 `Timer`，其中包含 `TID` 和 `Value`。
 - `Tick()`：推进一个最小时间粒度，并在返回前完成本次内部触发。
 - `Reset()`：清空定时器和 tick 状态，但不会停止时间轮。
 - `Stop()`：停止时间轮并清空内部状态。

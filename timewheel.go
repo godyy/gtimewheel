@@ -31,31 +31,25 @@ type LevelConfig struct {
 	Slots int
 }
 
-// TimerArgs 定时器参数.
-type TimerArgs struct {
+// Timer 定时器数据.
+type Timer struct {
 	// TID 定时器ID.
 	TID TimerID
 
-	// Periodic 是否为周期性定时器.
-	Periodic bool
-
-	// Args 定时器参数.
-	Args any
+	// Value 定时器值.
+	Value any
 }
 
-// TimerFunc 定时器回调函数.
-type TimerFunc func(TimerArgs)
-
-// TimerExecutor 定时器回调函数执行器.
-type TimerExecutor func(f TimerFunc, args TimerArgs)
+// TimerCallback 定时器触发回调.
+type TimerCallback func(timer Timer)
 
 // Config 时间轮配置.
 type Config struct {
 	// Levels 时间轮层级配置.
 	Levels []LevelConfig
 
-	// Executor 定时器回调函数执行器.
-	Executor TimerExecutor
+	// Callback 定时器触发回调.
+	Callback TimerCallback
 }
 
 // validate 验证配置轮配置是否有效.
@@ -81,8 +75,8 @@ func (c *Config) validate() error {
 			}
 		}
 	}
-	if c.Executor == nil {
-		return errors.New("timewheel: Config: Executor is nil")
+	if c.Callback == nil {
+		return errors.New("timewheel: Config: Callback is nil")
 	}
 	return nil
 }
@@ -114,7 +108,7 @@ type TimeWheel struct {
 	triggerRunWG   sync.WaitGroup     // 触发运行等待组.
 	triggerEndWG   sync.WaitGroup     // 触发结束等待组.
 	cStopped       chan struct{}      // 停止信号.
-	executor       TimerExecutor      // 执行器.
+	callback       TimerCallback      // 定时器触发回调.
 }
 
 // NewTimeWheel 创建时间轮
@@ -130,7 +124,7 @@ func NewTimeWheel(config *Config) (*TimeWheel, error) {
 		levels:         make([]*level, len(config.Levels)),
 		triggerWorkers: make([]chan *level, len(config.Levels)),
 		cStopped:       make(chan struct{}),
-		executor:       config.Executor,
+		callback:       config.Callback,
 	}
 
 	// 初始化层级
@@ -160,7 +154,7 @@ func NewTimeWheel(config *Config) (*TimeWheel, error) {
 }
 
 // Start 启动时间轮.
-// ts 未纳秒级时间戳.
+// ts 为纳秒级时间戳.
 func (tw *TimeWheel) Start(ts int64) {
 	if tw.state >= stateStarted {
 		return
@@ -243,15 +237,9 @@ func convertPeriodToTicks(period time.Duration, tickSpan time.Duration) int64 {
 	return ticks
 }
 
-// AddTimer 添加定时器. 若成功返回定时器ID.
-// 参数说明:
-//
-//	tid		定时器ID.
-//	ts 		到期时刻，纳秒级时间戳.
-//	period 	定时器周期.
-//	f 		回调函数.
-//	args	定时器参数.
-func (tw *TimeWheel) AddTimer(tid TimerID, ts int64, period time.Duration, f TimerFunc, args any) error {
+// AddTimer 添加定时器.
+// tid 为定时器ID，ts 为到期时刻的纳秒级时间戳，period 为周期，timerValue 为定时器值.
+func (tw *TimeWheel) AddTimer(tid TimerID, ts int64, period time.Duration, value any) error {
 	if tw.state != stateStarted {
 		return ErrTimeWheelNotStarted
 	}
@@ -268,10 +256,6 @@ func (tw *TimeWheel) AddTimer(tid TimerID, ts int64, period time.Duration, f Tim
 		period = 0
 	}
 
-	if f == nil {
-		return errors.New("timewheel: AddTimer: timer func is nil")
-	}
-
 	if tw.timers[tid] != nil {
 		return errors.New("timewheel: AddTimer: duplicate timer id")
 	}
@@ -280,7 +264,7 @@ func (tw *TimeWheel) AddTimer(tid TimerID, ts int64, period time.Duration, f Tim
 	periodTicks := convertPeriodToTicks(period, tw.tickSpan)
 
 	// 创建定时器.
-	timer := newTimer(tid, periodTicks, f, args)
+	timer := newTimer(tid, periodTicks, value)
 
 	// 计算定时器的调度时间点.
 	timer.scTicks = tw.calcScheduleTicks(ts)
@@ -325,15 +309,16 @@ func (tw *TimeWheel) pinTimer(timer *timer) {
 	level.mtx.Unlock()
 }
 
-// RemoveTimer 从时间轮中删除指定定时器
-func (tw *TimeWheel) RemoveTimer(tid TimerID) bool {
+// RemoveTimer 从时间轮中删除指定定时器.
+// 返回被删除定时器的值，以及是否删除成功.
+func (tw *TimeWheel) RemoveTimer(tid TimerID) (any, bool) {
 	if tw.state != stateStarted || tw.ticking {
-		return false
+		return nil, false
 	}
 
 	timer := tw.timers[tid]
 	if timer == nil {
-		return false
+		return nil, false
 	}
 	delete(tw.timers, tid)
 
@@ -343,7 +328,7 @@ func (tw *TimeWheel) RemoveTimer(tid TimerID) bool {
 		level.removeTimer(timer)
 	}
 
-	return true
+	return timer.value, true
 }
 
 // Tick 推进时间轮，处理到期定时器
@@ -369,8 +354,8 @@ func (tw *TimeWheel) TickTs() int64 {
 	return tw.tickTs
 }
 
-// TickTime 获取当前时间轮总Tick时间.
-func (tw *TimeWheel) TickTime() time.Duration {
+// TickDuration 获取当前时间轮总Tick时长.
+func (tw *TimeWheel) TickDuration() time.Duration {
 	return time.Duration(tw.ticks) * tw.tickSpan
 }
 
@@ -434,7 +419,7 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 		if tw.ticks >= timer.scTicks {
 			// 定时器已到期.
 
-			// 根据定时器是否周期性做相应处理.
+			// 根据定时器是否为周期性定时器做相应处理.
 			if timer.period > 0 {
 				// 周期性定时器, 重置状态.
 				timer.level = -1
@@ -448,11 +433,10 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 				tw.timersLock.Unlock()
 			}
 
-			// 执行定时器
-			tw.executor(timer.f, TimerArgs{
-				TID:      timer.id,
-				Periodic: timer.period > 0,
-				Args:     timer.args,
+			// 执行定时器触发回调.
+			tw.callback(Timer{
+				TID:   timer.id,
+				Value: timer.value,
 			})
 
 		} else {
@@ -465,21 +449,19 @@ func (tw *TimeWheel) triggerLevel(level *level) {
 
 // timer 定时器.
 type timer struct {
-	id      TimerID   // 定时器ID.
-	period  int64     // 周期Ticks.
-	f       TimerFunc // 回调函数.
-	args    any       // 参数.
-	level   int       // 所在层级.
-	slot    int       // 所在槽位.
-	scTicks int64     // 调度时间点, tick 数.
+	id      TimerID // 定时器ID.
+	period  int64   // 周期Ticks.
+	value   any     // 定时器值.
+	level   int     // 所在层级.
+	slot    int     // 所在槽位.
+	scTicks int64   // 调度时间点, tick 数.
 }
 
-func newTimer(id TimerID, period int64, f TimerFunc, args any) *timer {
+func newTimer(id TimerID, period int64, value any) *timer {
 	t := &timer{}
 	t.id = id
 	t.period = period
-	t.f = f
-	t.args = args
+	t.value = value
 	t.level = -1
 	t.slot = -1
 	t.scTicks = 0
